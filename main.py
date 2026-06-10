@@ -1,3 +1,6 @@
+# pip install cryptography
+
+
 import os
 import sys
 import time
@@ -9,55 +12,70 @@ import signal
 import hashlib
 import base64
 import re
-import pandas as pd
-import zipfile
-import numpy as np
-from filelock import FileLock, Timeout
 import logging
 from logging.handlers import RotatingFileHandler
+from filelock import FileLock, Timeout
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from datetime import datetime, timezone
+from datetime import datetime
+
 
 # === USER CONFIGURATION ===
 GCP_PROJECT_ID = "nld-data-pltf-acquiring-prod"  # change dev/qa/prod as needed
 GCLOUD_PATH = r"D:\Tools\google-cloud-sdk-517.0.0-windows-x86_64-bundled-python\google-cloud-sdk\bin\gcloud.cmd"
-DIRECTORY_PATH = "//swnas-01.core.zone/pwcdataswan$/SrcFiles/INPUT/TDS"
+DIRECTORY_PATH = r"\\swnas-01.core.zone\pwcdataswan$\TgtFiles"
 
 
-# <<< MODIFIED: Renamed variables for clarity and consistency
-PROCESSED_FILES_DIRECTORY = f"{DIRECTORY_PATH}/PROCESSED"
-IN_DIRECTORY = f"{DIRECTORY_PATH}/IN"
-ARCHIVE_DIRECTORY = f"{DIRECTORY_PATH}/temp_processing"  # New temporary folder
-STAGING_DIRECTORY = f"{DIRECTORY_PATH}/staging_files"
-
-ie_archive_folder = f"{DIRECTORY_PATH}/ictf_files_archive"
-error_folder = f"{DIRECTORY_PATH}/error_files"
+zip_watch_folder = f"{DIRECTORY_PATH}/OutgoingCloud"
+archive_folder = f"{DIRECTORY_PATH}/OutgoingCloud/archive"
+swan_report_archive_folder = f"{DIRECTORY_PATH}/OutgoingCloud/swan_report_archive"
+error_folder = f"{DIRECTORY_PATH}/OutgoingCloud/zipfile_error"
+staging_folder = f"{DIRECTORY_PATH}/OutgoingCloud/zipfile_staging" # For files that can be retried
 service_account_key = r"D:\Tools\google-cloud-sdk-517.0.0-windows-x86_64-bundled-python\google-cloud-sdk\bin\config_files_cloudsetup_authent\nld-data-pltf-acquiring-prod-5abd33991c30.json"
 kms_key_name = "projects/nld-data-pltf-acquiring-prod/locations/europe/keyRings/prod_swan_inbound_encryption-PhwwT/cryptoKeys/prod_swan_inbound_encryption_kms_key"
 
-DEFAULT_GCS_BUCKET = f"gs://{GCP_PROJECT_ID}-swan-inbound/in/swan-inbound"
-critical_error_log_name = "ie-uploader-activity"
-activity_log_name = "ie-uploader-activity"
 
-IE_ACQUIRER_IDS = {"00673072009", "00673005005", "00673002008"}
+bucket_name_patterns = {
+"SWANDWH.XIMEDES.DEFPAY": f"gs://{GCP_PROJECT_ID}-swan-inbound/swan-report/out/ING/DEFPAY/",
+"SWANDWH.XIMEDES.DEFACQTR": f"gs://{GCP_PROJECT_ID}-swan-inbound/swan-report/out/ING/DEFACQTR/",
+"SWANDWH.RABOM201.DEFACQTR": f"gs://{GCP_PROJECT_ID}-swan-inbound/swan-report/out/RABO/DEFACQTR/",
+"SWANDWH.RABOM201.DEFPAY": f"gs://{GCP_PROJECT_ID}-swan-inbound/swan-report/out/RABO/DEFPAY/",
+"R0000030.INGTVPB.QM9013CA": f"gs://{GCP_PROJECT_ID}-swan-inbound/swan-report/out/ING/QMR_9013_CA/",
+"R0000030.INGTVPB.QMRPFA": f"gs://{GCP_PROJECT_ID}-swan-inbound/swan-report/out/ING/QMR_PFA/",
+"R0000030.INGTVPB.QM9011CB": f"gs://{GCP_PROJECT_ID}-swan-inbound/swan-report/out/ING/QMR_9011_CB/",
+"R0000030.INGTVPB.QM9011CD": f"gs://{GCP_PROJECT_ID}-swan-inbound/swan-report/out/ING/QMR_9011_CD/",
+"R0000030.INGTVPB.QM3106QC": f"gs://{GCP_PROJECT_ID}-swan-inbound/swan-report/out/ING/QMR_3106_QC/",
+"R0000030.INGTVPB.QM3104QZ": f"gs://{GCP_PROJECT_ID}-swan-inbound/swan-report/out/ING/QMR_3104_QZ/",
+"DEFAULT": f"gs://{GCP_PROJECT_ID}-swan-inbound/in/swan-inbound",
+}
+
+critical_error_log_name = "zip-uploader-activity"
+activity_log_name = "zip-uploader-activity"
+swan_report_log_name = "swan-report-uploader-activity"
+
+ACQUIRER_IDS = {"673072009", "673072008", "673002008"}  # add any new acquirer IDs here
+PATTERNS = [
+    ("SWAN.FUTURO.W4TXFEE", 7),
+    ("SWAN.FUTURO.W4TXPMT", 7),
+    ("SWAN.FUTURO.ICTF", 6),
+    ("SWAN.FUTURO.CIMTRM", 5),
+    ("SWAN.FUTURO.CIM", 5),
+]
+SWAN_HISTORY_DATE_PATTERN = re.compile(
+    # Expected file date segment format is ddmmyyyy (8 digits); calendar validity is not checked here.
+    r"^SWAN\.FUTURO\.(W4TXFEE|W4TXPMT)\.673002008\.\d{8}\.zip$",
+    re.IGNORECASE,
+)
 
 is_ctrlc_exit = False
 gcloud_auth_success = False
-FILE_STABILITY_WAIT_SECONDS = 300 # Wait up to 5 minutes for a file to become stable
 HEARTBEAT_INTERVAL_SECONDS = 300  # 5 minutes
-STAGING_RETRY_INTERVAL_SECONDS = 20 * 60  # 20 minutes
-STAGING_MAX_RETRIES = 10
 
 # Logging setup
-log_file_path = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "ie-uploader.log"
-)
-logger = logging.getLogger("IEUploaderLogger")
+log_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "zip-uploader.log")
+logger = logging.getLogger("ZipUploaderLogger")
 logger.setLevel(logging.DEBUG)
-file_handler = RotatingFileHandler(
-    log_file_path, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
-)
-formatter = logging.Formatter("%(asctime)s [%(levelname)s] [%(funcName)s] - %(message)s")
+file_handler = RotatingFileHandler(log_file_path, maxBytes=5 * 1024 * 1024, backupCount=3, encoding='utf-8')
+formatter = logging.Formatter("%(asctime)s %(levelname)s - %(message)s")
 file_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
 console_handler = logging.StreamHandler()
@@ -65,9 +83,7 @@ console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
 
 
-def log_and_print(
-    message: str, level="info"
-):  # This function is kept for compatibility with existing calls.
+def log_and_print(message: str, level="info"): # This function is kept for compatibility with existing calls.
     getattr(logger, level.lower(), logger.info)(message)
 
 
@@ -77,84 +93,69 @@ def ensure_directory_exists(path):
         os.makedirs(path, exist_ok=True)
 
 
-ensure_directory_exists(PROCESSED_FILES_DIRECTORY)
-ensure_directory_exists(IN_DIRECTORY)
+ensure_directory_exists(archive_folder)
 ensure_directory_exists(error_folder)
-ensure_directory_exists(ie_archive_folder)
-ensure_directory_exists(ARCHIVE_DIRECTORY)  # Ensure the new temp folder exists
-ensure_directory_exists(STAGING_DIRECTORY)
+ensure_directory_exists(swan_report_archive_folder)
+ensure_directory_exists(staging_folder)
 
 
-def authenticate_gcloud(force_reauthenticate=False):
+def authenticate_gcloud(max_retries=5, initial_backoff=250):
     global gcloud_auth_success
-    if gcloud_auth_success and not force_reauthenticate:
-        logger.debug("gcloud authentication already active. Skipping re-authentication.")
-        return True
+    attempt = 0
+    backoff = initial_backoff
+    while attempt < max_retries:
+        logger.info(f"Authenticating with gcloud service account (Attempt {attempt + 1}/{max_retries})...")
+        if not os.path.exists(service_account_key):
+            raise Exception(f"Key file not found: {service_account_key}")
+        try:
+            result = subprocess.run(
+                ['cmd', '/c', GCLOUD_PATH, "auth", "activate-service-account", f"--key-file={service_account_key}"],
+                capture_output=True,
+                check=True,
+                timeout=120 # Add a timeout to the subprocess call
+            )
+            logger.info("gcloud authentication successful.")
+            gcloud_auth_success = True
+            return True
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            stderr_msg = e.stderr.decode().strip() if hasattr(e, 'stderr') and e.stderr else str(e)
+            logger.error(f"gcloud auth error on attempt {attempt + 1}: {stderr_msg}")
+            attempt += 1
+            if attempt < max_retries:
+                logger.info(f"Retrying in {backoff} seconds...")
+                time.sleep(backoff)
+                backoff *= 2  # Exponential backoff
+    logger.critical("Maximum retry attempts reached for gcloud authentication. Exiting.")
+    return False
 
-    logger.info("Authenticating with gcloud service account...")
-    if not os.path.exists(service_account_key):
-        raise Exception(f"Key file not found: {service_account_key}")
-    # <<< FIX: Use 'cmd /c' to run the .cmd file and pass arguments as a list
-    command = [
-        'cmd', '/c',
-        GCLOUD_PATH,
-        "auth",
-        "activate-service-account",
-        f"--key-file={service_account_key}",
-    ]
-    result = subprocess.run(
-        command,
-        capture_output=True,
-    )
-    if result.returncode != 0:
-        stderr_msg = result.stderr.decode().strip()
-        logger.error(f"gcloud auth error: {stderr_msg}")
-        gcloud_auth_success = False
-        raise Exception("Failed to authenticate with gcloud. Exiting.")
-    logger.info("gcloud authentication successful.")
-    gcloud_auth_success = True
-    return True
 
-
-def wait_file_ready(file_path, total_wait_seconds=FILE_STABILITY_WAIT_SECONDS, check_interval_seconds=2):
-    """
-    Waits for a file to be stable (size not changing and not locked) for a specified duration.
-    """
-    start_time = time.time()
-    last_size = -1
-    
-    while time.time() - start_time < total_wait_seconds:
+def wait_file_ready(file_path, max_retries=10, sleep_seconds=1):
+    retry_count = 0
+    while retry_count < max_retries:
         try:
             if not os.path.exists(file_path):
                 logger.warning(f"File '{os.path.basename(file_path)}' no longer exists. Skipping.")
                 return False, "File disappeared"
-
+            initial_size = os.path.getsize(file_path)
+            time.sleep(sleep_seconds)
             current_size = os.path.getsize(file_path)
-            
-            if current_size == last_size:
-                # Size is stable, now check if it's locked
-                try:
-                    with open(file_path, 'rb'):
-                        pass # Successfully opened, so it's not locked
-                    
-                    if current_size > 0:
-                        logger.debug(f"File '{os.path.basename(file_path)}' is stable, unlocked, and not empty.")
-                        return True, "File is stable"
-                    else:
-                        logger.warning(f"File '{os.path.basename(file_path)}' is stable but empty.")
-                        return False, "File is empty"
-                except (IOError, PermissionError):
-                    logger.debug(f"File '{os.path.basename(file_path)}' size is stable but file is locked. Waiting...")
-            
-            last_size = current_size
-            time.sleep(check_interval_seconds)
-
+            if initial_size == current_size:
+                if initial_size > 0:
+                    logger.debug(f"File '{file_path}' is stable and not empty.")
+                    return True, "File is stable"
+                else: # File is stable but empty
+                    logger.warning(f"File '{os.path.basename(file_path)}' is stable but empty.")
+                    return False, "File is empty"
+            retry_count += 1
+            time.sleep(0.5)
         except FileNotFoundError:
             logger.warning(f"File '{os.path.basename(file_path)}' was removed during stability check. Skipping.")
             return False, "File disappeared"
-
-    logger.warning(f"File '{os.path.basename(file_path)}' did not stabilize within the {total_wait_seconds} second wait period.")
-    return False, "File is unstable or locked"
+    log_and_print(
+        f"File '{file_path}' did not become stable or was empty after {max_retries} retries.",
+        "warning",
+    )
+    return False, "File is unstable"
 
 
 def get_file_md5_base64(file_path):
@@ -167,109 +168,109 @@ def get_file_md5_base64(file_path):
         logger.debug(f"MD5 (base64) for '{file_path}': {md5_b64}")
         return md5_b64
     except Exception as e:
-        logger.error(
-            f"Could not compute MD5 hash for '{file_path}'. Error: {str(e)}",
-            exc_info=True,
-        )
+        logger.error(f"Could not compute MD5 hash for '{file_path}'. Error: {str(e)}", exc_info=True)
         return None
 
 
-def build_unique_path(directory, file_name):
-    base_name, ext = os.path.splitext(file_name)
-    candidate = os.path.join(directory, file_name)
-    if not os.path.exists(candidate):
-        return candidate
+def file_name_matches(filename):
+    """
+    Determines if filename matches expected pattern.
+    Handles optional extra segment and optional sequence part.
+    Accepts filenames with or without sequence like Dxxxxxx.
+    """
+    name = filename
+    if name.lower().endswith(".zip"):
+        name = name[:-4]
+    parts = name.split(".")
+    if len(parts) < 4:
+        return False
+    prefix = ".".join(parts[:3])  # e.g. SWAN.FUTURO.ICTF
 
-    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-    suffix = 1
-    while True:
-        candidate_name = f"{base_name}_{timestamp}_{suffix}{ext}"
-        candidate = os.path.join(directory, candidate_name)
-        if not os.path.exists(candidate):
-            return candidate
-        suffix += 1
+    for pattern_prefix, seq_length in PATTERNS:
+        if prefix == pattern_prefix:
+            # Case 1: Filename has an acquirer ID but no sequence.
+            # e.g., SWAN.FUTURO.CIM.673002008
+            if len(parts) == 4 and parts[3] in ACQUIRER_IDS:
+                return True
+
+            # Case 2: Filename has a sequence and an acquirer ID.
+            # e.g., SWAN.FUTURO.ICTF.IE000001.673072009
+            if len(parts) == 5:
+                # Handle both [prefix].[sequence].[acquirer_id] and [prefix].[acquirer_id].[sequence]
+                if parts[4] in ACQUIRER_IDS:
+                    sequence_part = parts[3] # Sequence is the 4th part
+                elif parts[3] in ACQUIRER_IDS:
+                    sequence_part = parts[4] # Sequence is the 5th part
+                else:
+                    continue # Does not match a known structure
+
+            # Case 3: Filename has a sequence but no acquirer ID.
+            # e.g., SWAN.FUTURO.ICTF.IE000001
+            elif len(parts) == 4 and parts[3] not in ACQUIRER_IDS:
+                sequence_part = parts[3]
+            else: # Does not match a known structure for this prefix
+                continue
+            # --- Validate the sequence part ---
+            # For CIMTRM files, if sequence starts with 'D', it's an error.
+            if prefix == "SWAN.FUTURO.CIMTRM" and sequence_part.startswith('D'):
+                logger.warning(f"Invalid sequence for CIMTRM file '{filename}': sequence should not start with 'D'.")
+                return False
+
+            # Allow sequence with or without a leading 'D', 'I', or 'IE'
+            if sequence_part.startswith('IE'):
+                seq_num = sequence_part[2:]
+            elif sequence_part.startswith(('D', 'I')):
+                seq_num = sequence_part[1:]
+            else:
+                # If no prefix, check if the whole part is a digit of the right length
+                # This handles cases where the sequence is just numbers.
+                if sequence_part.isdigit() and len(sequence_part) == seq_length:
+                    return True
+                seq_num = sequence_part
+
+            # Final check on the numeric part of the sequence
+            if seq_num.isdigit() and len(seq_num) == seq_length:
+                return True
+
+    # If the loop completes without finding a match, the pattern is invalid.
+    return False
 
 
-def _move_file_to_directory(file_path, destination_directory, action):
-    file_name = os.path.basename(file_path)
-    if not os.path.exists(file_path):
-        logger.warning(f"Skip move for '{file_name}'. File no longer exists. Action: {action}")
-        return None
+def swan_report_pattern(filename):
+    # Check if the filename starts with "SWANDWH.XIMEDES"
+    return filename.startswith("SWANDWH.XIMEDES")
 
-    destination_path = build_unique_path(destination_directory, file_name)
-    shutil.move(file_path, destination_path)
-    logger.info(f"Moved '{file_name}' to '{destination_path}'. Action: {action}")
-    return destination_path
-
-
-def safe_remove_file(file_path):
-    if not file_path or not os.path.exists(file_path):
-        return
-    try:
-        os.remove(file_path)
-    except Exception as e:
-        logger.warning(f"Failed to remove temporary file '{file_path}': {e}", exc_info=True)
+def swan_history_pattern(filename):
+    return bool(SWAN_HISTORY_DATE_PATTERN.match(filename))
 
 
 def move_to_error_folder(file_path, reason):
     file_name = os.path.basename(file_path)
+    dest_path = os.path.join(error_folder, file_name)
     try:
-        dest_path = _move_file_to_directory(file_path, error_folder, f"error | {reason}")
-        if not dest_path:
-            return
-
+        shutil.move(file_path, dest_path)
+        logger.error(f"Moved '{file_name}' to error folder due to: {reason}")
         send_cloud_log_entry(
             severity="ERROR",
-            message=f"'{file_name}' moved to error folder. Reason: {reason}",
+            message=f"File '{file_name}' was moved to the error folder. Reason: {reason}",
             log_name=critical_error_log_name,
             data={
                 "event_type": "FileMoveToError",
                 "file": file_name,
                 "reason": reason,
-                "destination_path": dest_path,
             },
         )
     except Exception as e:
-        logger.critical(
-            f"Failed to move '{file_name}' to error folder: {str(e)}", exc_info=True
-        )
+        logger.critical(f"Failed to move '{file_name}' to error folder: {str(e)}", exc_info=True)
+
 
 def move_to_staging_folder(file_path, reason):
     """Moves a file to the staging folder for a later retry attempt."""
     file_name = os.path.basename(file_path)
+    dest_path = os.path.join(staging_folder, file_name)
     try:
-        is_already_in_staging = False
-        # samefile handles symlinks and path aliases when both paths exist;
-        # normalized absolute path comparison is used as a safe fallback.
-        try:
-            if os.path.exists(file_path) and os.path.exists(STAGING_DIRECTORY):
-                is_already_in_staging = os.path.samefile(os.path.dirname(file_path), STAGING_DIRECTORY)
-        except OSError:
-            pass
-        if not is_already_in_staging:
-            staging_dir_abs = os.path.normpath(os.path.abspath(STAGING_DIRECTORY))
-            file_dir_abs = os.path.normpath(os.path.abspath(os.path.dirname(file_path)))
-            is_already_in_staging = (file_dir_abs == staging_dir_abs)
-
-        if is_already_in_staging:
-            logger.info(f"File '{file_name}' is already in staging. Keeping it for retry. Reason: {reason}")
-            send_cloud_log_entry(
-                severity="WARNING",
-                message=f"File '{file_name}' remains in staging for retry. Reason: {reason}",
-                log_name=activity_log_name,
-                data={
-                    "event_type": "FileRetainedInStaging",
-                    "file": file_name,
-                    "reason": reason,
-                    "destination_path": file_path,
-                },
-            )
-            return file_path
-
-        dest_path = _move_file_to_directory(file_path, STAGING_DIRECTORY, f"staging | {reason}")
-        if not dest_path:
-            return
-
+        shutil.move(file_path, dest_path)
+        logger.warning(f"Moved '{file_name}' to staging folder for retry. Reason: {reason}")
         send_cloud_log_entry(
             severity="WARNING",
             message=f"File '{file_name}' was moved to the staging folder for retry. Reason: {reason}",
@@ -278,83 +279,12 @@ def move_to_staging_folder(file_path, reason):
                 "event_type": "FileMoveToStaging",
                 "file": file_name,
                 "reason": reason,
-                "destination_path": dest_path,
             },
         )
     except Exception as e:
-        logger.critical(
-            f"CRITICAL: Failed to move '{file_name}' to staging folder. It will be retried from the source folder. Error: {str(e)}",
-            exc_info=True,
-        )
+        logger.critical(f"CRITICAL: Failed to move '{file_name}' to staging folder. It will be retried from the source folder. Error: {str(e)}", exc_info=True)
 
-
-def move_to_archive_folder(file_path, reason):
-    file_name = os.path.basename(file_path)
-    try:
-        destination = _move_file_to_directory(file_path, ie_archive_folder, f"archive | {reason}")
-        if not destination:
-            logger.warning(f"Skip archive move for '{file_name}'. File no longer exists.")
-        return destination
-    except Exception as e:
-        logger.error(f"Failed to move '{file_name}' to archive folder. Reason: {reason}. Error: {e}", exc_info=True)
-        return None
-
-
-def find_archived_file_match(file_name):
-    """
-    Return an archived file path when a duplicate is found by name.
-
-    Parameters:
-        file_name (str): File name to search for in the archive folder.
-
-    Returns:
-        str | None: The matched archived file path (exact or collision-variant)
-        if found; otherwise None.
-
-    Checks exact file name first. If not found, checks collision-safe variants
-    generated by this script (e.g. `name_YYYYMMDDHHMMSS_1.ext`).
-    """
-    if not file_name:
-        return None
-    if not os.path.isdir(ie_archive_folder):
-        logger.warning(f"Archive directory does not exist or is inaccessible: '{ie_archive_folder}'")
-        return None
-
-    exact_path = os.path.join(ie_archive_folder, file_name)
-    if os.path.exists(exact_path):
-        return exact_path
-
-    base_name, ext = os.path.splitext(file_name)
-    pattern = os.path.join(ie_archive_folder, f"{base_name}_*{ext}")
-    matches = sorted(glob.glob(pattern))
-    if matches:
-        return matches[0]
-    return None
-
-
-def is_authentication_error(error_text):
-    text = (error_text or "").lower()
-    auth_keywords = (
-        "unauthenticated",
-        "authentication",
-        "permission denied",
-        "invalid_grant",
-        "not have permission",
-        "access denied",
-        "forbidden",
-        "account disabled",
-        "credentials",
-        "failed to retrieve token",
-        "request had insufficient authentication scopes",
-    )
-    return any(keyword in text for keyword in auth_keywords)
-
-def send_cloud_log_entry(
-    severity="INFO", message="", log_name="ie-uploader-activity", data=None
-):
-    max_retries = 3
-    base_delay_seconds = 5
-
+def send_cloud_log_entry(severity="INFO", message="", log_name="zip-uploader-activity", data=None):
     if data is None:
         data = {}
     payload = {
@@ -362,208 +292,187 @@ def send_cloud_log_entry(
         "message": message,
         "script_name": os.path.abspath(sys.argv[0]),
         "host": os.environ.get("COMPUTERNAME", ""),
-        "watch_folder": PROCESSED_FILES_DIRECTORY,
-        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "watch_folder": zip_watch_folder,
+        "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
     payload.update(data)
-    # The payload is a single string argument for the --json-payload flag.
-    # json.dumps ensures it's a valid JSON string.
-    json_payload_str = json.dumps(payload)
-
-    for attempt in range(max_retries):
-        try:
-            # Pass the JSON payload as a separate argument to avoid shell quoting issues on Windows.
-            command = [
-                'cmd', '/c',
-                GCLOUD_PATH,
-                "logging",
-                "write",
-                log_name,
-                json_payload_str,
-                f"--project={GCP_PROJECT_ID}",
-            ]
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                check=False, # Explicitly set to False to handle errors manually
+    json_payload = json.dumps(payload)
+    try:
+        # Pass the JSON payload as a separate argument to avoid shell quoting issues.
+        result = subprocess.run(
+            [
+                'cmd', '/c', GCLOUD_PATH, "logging", "write", log_name,
+                json_payload,
+                f"--project={GCP_PROJECT_ID}"
+            ],
+            capture_output=True,
+            check=False # Handle non-zero exit codes manually
+        )
+        if result.returncode != 0:
+            raise Exception(
+                f"gcloud logging write command failed with exit code {result.returncode}: {result.stderr.decode().strip()}"
             )
-            if result.returncode == 0:
-                logger.debug(
-                    f"Sent log to Cloud Logging (logName: {log_name}, severity: {severity})."
-                )
-                return # Success, exit the function
-            else:
-                # Raise an exception to be caught and retried
-                raise Exception(
-                    f"gcloud logging write command failed with exit code {result.returncode}: {result.stderr.decode().strip()}"
-                )
-        except Exception as e:
-            logger.warning(
-                f"Attempt {attempt + 1}/{max_retries} to send log failed. Error: {str(e)}"
-            )
-            if attempt < max_retries - 1:
-                delay = base_delay_seconds * (2 ** attempt) # Exponential backoff
-                logger.info(f"Retrying in {delay} seconds...")
-                time.sleep(delay)
-            else:
-                logger.critical(f"Failed to send log entry to Google Cloud after {max_retries} attempts.", exc_info=True)
-                # The original exception 'e' is available here if you need to re-raise it or handle it further.
+        logger.debug(f"Sent log to Cloud Logging (logName: {log_name}, severity: {severity}).")
+    except Exception as e:
+        logger.critical(f"Failed writing log entry to Google Cloud Logging. Error: {str(e)}", exc_info=True)
 
 
-def encrypt_upload_and_archive(file_path, source_file_path=None):
+def upload_and_archive_zip(file_path):
     file_name = os.path.basename(file_path)
     lock_path = file_path + ".lock"
     lock = FileLock(lock_path, timeout=1)
 
     try:
         with lock:
-            return _process_locked_encrypt_file(file_path, source_file_path=source_file_path)
+            # If we acquire the lock, process the file.
+            # The original logic of upload_and_archive_zip goes here.
+            return _process_locked_file(file_path)
     except Timeout:
+        # Could not acquire lock, another process is handling it.
         logger.debug(f"File '{file_name}' is locked by another process. Skipping.")
-        return False
+        return False # Indicate that this file was not processed by this instance.
 
-def _process_locked_encrypt_file(file_path, source_file_path=None):
-    max_retries = 3
-    retry_delay_seconds = 5
+def _process_locked_file(file_path):
     file_name = os.path.basename(file_path)
+    encrypted_file_name = f"{file_name}.enc"
+    archive_dest = "" # Initialize archive destination
 
-    # Determine the GCS object name based on the output file naming convention
-    if "_" in file_name:
-        gcs_object_name = file_name.split("_", 1)[-1]
-    else:
-        gcs_object_name = file_name
-    gcs_path = f"{DEFAULT_GCS_BUCKET}/{gcs_object_name}"
-    log_name = activity_log_name
-    alert_name = "FileEncryptedUploadSuccess"
-    logger.info(f"Starting encryption and upload for '{file_name}'")
-
-    archived_zip_match = find_archived_file_match(file_name)
-    source_file_name = os.path.basename(source_file_path) if source_file_path else None
-    archived_source_match = find_archived_file_match(source_file_name) if source_file_name else None
-    if archived_zip_match or archived_source_match:
-        logger.warning(
-            f"Duplicate detected before upload for '{file_name}'. "
-            f"archived_zip_match='{archived_zip_match}', archived_source_match='{archived_source_match}'. "
-            "Skipping GCS upload."
-        )
-        archive_path = move_to_archive_folder(file_path, "Duplicate detected before upload; skipped GCS upload")
-        source_archive_path = None
-        if source_file_path:
-            source_archive_path = move_to_archive_folder(
-                source_file_path,
-                f"Duplicate detected before upload for '{file_name}'; skipped GCS upload",
-            )
-        send_cloud_log_entry(
-            severity="WARNING",
-            message=f"Skipped upload for duplicate file '{file_name}' because it already exists in archive.",
-            log_name=activity_log_name,
-            data={
-                "event_type": "DuplicateUploadSkipped",
-                "file": file_name,
-                "source_file": source_file_name,
-                "archive_path": archive_path,
-                "source_archive_path": source_archive_path,
-                "archived_zip_match": archived_zip_match,
-                "archived_source_match": archived_source_match,
-            },
-        )
-        return True
-
-    # --- NEW: Retry loop for file stability check ---
-    max_stability_retries = 5
-    is_ready = False
-    reason = "Unknown"
-    encrypted_output_file_path = None
-    last_exception = None
-    timed_out = False
-    for stability_attempt in range(max_stability_retries):
-        logger.info(f"Checking file stability for '{file_name}' (Attempt {stability_attempt + 1}/{max_stability_retries})...")
-        is_ready, reason = wait_file_ready(file_path)
-        if is_ready:
-            break # File is ready, exit the loop
-        elif reason == "File disappeared" or reason == "File is empty":
-            break # No point in retrying if file is gone or empty
-        if stability_attempt < max_stability_retries - 1:
-            logger.info(f"Will re-check stability for '{file_name}' in the next main loop cycle.")
+    # Refactored logic for pattern matching
+    gcs_path = ""
+    pattern_type = ""
     
-    if not is_ready:
-        logger.error(f"FAILURE: File '{file_name}' was not ready after {max_stability_retries} attempts. Reason: {reason}. Moving to error folder.")
-        move_to_error_folder(file_path, f"File not stable after {max_stability_retries} attempts ({max_stability_retries * (FILE_STABILITY_WAIT_SECONDS/60):.0f} mins total). Reason: {reason}")
-        if source_file_path:
-            move_to_error_folder(source_file_path, f"Related upload file '{file_name}' was not stable.")
+    if swan_history_pattern(file_name):
+        gcs_path = f"gs://{GCP_PROJECT_ID}-swan-inbound/in/swan-history/{file_name}"
+        pattern_type = "SWAN_HISTORY"
+    else:
+        # Check for specific SWAN report patterns next
+        for pattern, path in bucket_name_patterns.items():
+            if pattern != "DEFAULT" and file_name.startswith(pattern):
+                gcs_path = f"{path}{file_name}"
+                pattern_type = "SWANDWH"
+                break # Found a match, exit the loop
+
+    if gcs_path:
+        # Configure logging and archive destination for matched special patterns.
+        if pattern_type == "SWANDWH":
+            log_name = swan_report_log_name
+            alert_name = "SwanReportFileUploadSuccess"
+            archive_dest = os.path.join(swan_report_archive_folder, file_name)
+        elif pattern_type == "SWAN_HISTORY":
+            log_name = activity_log_name
+            alert_name = "FileUploadSuccess"
+            archive_dest = os.path.join(archive_folder, file_name)
+    elif file_name_matches(file_name): # Check for other file types
+        # The destination GCS object will have the original filename, not the .enc extension.
+        gcs_path = f"{bucket_name_patterns['DEFAULT']}/{file_name}"
+        archive_dest = os.path.join(archive_folder, file_name)
+        log_name = activity_log_name
+        alert_name = "FileUploadSuccess"
+        pattern_type = "EXISTING"
+    else:
+        logger.warning(f"File '{file_name}' does NOT match expected patterns. Moving to error folder.")
+        # This is a critical path. If moving to error fails, we must stop to prevent accidental upload.
+        try:
+            move_to_error_folder(file_path, "Filename pattern or acquirer/sequence ID mismatch")
+            send_cloud_log_entry(
+                severity="ERROR",
+                message=f"File pattern mismatch for '{file_name}'. Moved to error folder.",
+                log_name=critical_error_log_name,
+                data={"event_type": "FilePatternMismatch", "file": file_name},
+            )
+        except Exception as e:
+            # If we can't even move the bad file, we must exit to avoid processing it incorrectly.
+            logger.critical(f"CRITICAL: Failed to move mismatched file '{file_name}' to error folder. Exiting to prevent incorrect processing. Error: {e}", exc_info=True)
+            sys.exit(1) # Hard exit to stop the script immediately.
         return False
 
-    for attempt in range(max_retries):
-        # --- FIX: Create the temporary encrypted file in the ARCHIVE_DIRECTORY ---
-        # This prevents the script from re-processing its own output.
-        encrypted_output_file_name = file_name + ".enc"
-        encrypted_output_file_path = os.path.join(ARCHIVE_DIRECTORY, encrypted_output_file_name)
-        try:
-            # 1. Generate a new Data Encryption Key (DEK) for each file.
-            # --- Envelope Encryption (DEK) Implementation ---
-            dek = AESGCM.generate_key(bit_length=256)
-            logger.info(f"Generated a 256-bit DEK for '{file_name}'.")
+    logger.info(f"Processing file: '{file_name}'")
 
-            # 2. Encrypt (wrap) the DEK using the Cloud KMS key.
-            logger.info(
-                f"Attempt {attempt + 1}/{max_retries}: Wrapping the DEK for '{file_name}' using Cloud KMS..."
-            )
-            key_parts = kms_key_name.split('/')
-            kms_project = key_parts[1]
-            kms_location = key_parts[3]
-            kms_keyring = key_parts[5]
-            kms_key = key_parts[7]
+    is_ready, reason = wait_file_ready(file_path)
+    if not is_ready:
+        logger.warning(f"File '{file_name}' is not ready for upload. Reason: {reason}. Moving to error folder.")
+        move_to_error_folder(file_path, f"File not stable or empty. Reason: {reason}")
+        return False # Stop processing this file
 
-            wrap_dek_command = [
-                'cmd', '/c', GCLOUD_PATH, "kms", "encrypt",
-                f"--project={kms_project}",
-                f"--location={kms_location}",
-                f"--keyring={kms_keyring}",
-                f"--key={kms_key}",
-                "--plaintext-file=-",      # Read plaintext from stdin
-                "--ciphertext-file=-",     # Write ciphertext to stdout
-            ]
-            wrap_proc = subprocess.run(
-                wrap_dek_command,
-                input=dek,
-                capture_output=True,
-                check=True
-            )
-            wrapped_dek = wrap_proc.stdout
-            logger.info(f"Successfully wrapped the DEK for '{file_name}'.")
+    local_md5 = get_file_md5_base64(file_path)
+    if not local_md5:
+        logger.error(f"MD5 calculation failed for '{file_name}'. Skipping upload.")
+        return False
 
-            # 3. Encrypt the actual file data locally using the DEK.
-            logger.info(f"Encrypting file content of '{file_name}' locally with the DEK.")
-            with open(file_path, "rb") as f_in:
-                plaintext_data = f_in.read()
+    # --- Envelope Encryption (DEK) Implementation ---
+    encrypted_output_file_path = os.path.join(os.path.dirname(file_path), encrypted_file_name)
+    try:
+        # 1. Generate a new Data Encryption Key (DEK) for each file.
+        dek = AESGCM.generate_key(bit_length=256)
+        logger.info(f"Generated a 256-bit DEK for '{file_name}'.")
 
-            aes_gcm = AESGCM(dek)
-            nonce = os.urandom(12)  # GCM recommended nonce size
-            encrypted_data = aes_gcm.encrypt(nonce, plaintext_data, None)
+        # 2. Encrypt (wrap) the DEK using the Cloud KMS key.
+        logger.info(f"Wrapping the DEK for '{file_name}' using Cloud KMS.")
+        key_parts = kms_key_name.split('/')
+        kms_project = key_parts[1]
+        kms_location = key_parts[3]
+        kms_keyring = key_parts[5]
+        kms_key = key_parts[7]
 
-            # 4. Write the combined encrypted file (wrapped_dek_len + wrapped_dek + nonce + encrypted_data).
-            with open(encrypted_output_file_path, "wb") as f_out:
-                f_out.write(len(wrapped_dek).to_bytes(4, 'big'))
-                f_out.write(wrapped_dek)
-                f_out.write(nonce)
-                f_out.write(encrypted_data)
-            logger.info(f"Created combined encrypted file: '{os.path.basename(encrypted_output_file_path)}'.")
+        # We pass the DEK via stdin to avoid temporary files for the key.
+        wrap_dek_command = [
+            'cmd', '/c', GCLOUD_PATH, "kms", "encrypt",
+            f"--project={kms_project}",
+            f"--location={kms_location}",
+            f"--keyring={kms_keyring}",
+            f"--key={kms_key}",
+            "--plaintext-file=-",      # Read plaintext from stdin
+            "--ciphertext-file=-",     # Write ciphertext to stdout
+        ]
+        wrap_proc = subprocess.run(
+            wrap_dek_command,
+            input=dek,
+            capture_output=True,
+            check=True
+        )
+        wrapped_dek = wrap_proc.stdout
+        logger.info(f"Successfully wrapped the DEK for '{file_name}'.")
 
-            # 5. Upload the final encrypted file to GCS.
-            logger.info(f"Uploading encrypted file '{os.path.basename(encrypted_output_file_path)}' to GCS path '{gcs_path}'...")
-            upload_command = [
-                'cmd', '/c', GCLOUD_PATH, "storage", "cp", encrypted_output_file_path, gcs_path,
-                f"--project={GCP_PROJECT_ID}",
-            ]
-            subprocess.run(upload_command, capture_output=True, check=True, timeout=900)
-            logger.info(f"SUCCESS: Upload of encrypted file '{gcs_object_name}' complete.")
+        # 3. Encrypt the actual file data locally using the DEK.
+        logger.info(f"Encrypting file content of '{file_name}' locally with the DEK.")
+        with open(file_path, "rb") as f_in:
+            plaintext_data = f_in.read()
 
-            archive_path = move_to_archive_folder(file_path, "Encrypted upload successful")
-            source_archive_path = None
-            if source_file_path:
-                source_archive_path = move_to_archive_folder(source_file_path, f"Pipeline successful for '{file_name}'")
+        aes_gcm = AESGCM(dek)
+        nonce = os.urandom(12)  # GCM recommended nonce size
+        encrypted_data = aes_gcm.encrypt(nonce, plaintext_data, None)
 
-            msg = f"[{alert_name}] '{gcs_object_name}' was encrypted via Envelope Encryption and uploaded to bucket."
+        # 4. Write the combined encrypted file (wrapped_dek_len + wrapped_dek + nonce + encrypted_data).
+        with open(encrypted_output_file_path, "wb") as f_out:
+            # Prepend the length of the wrapped DEK as a fixed-size header (4 bytes).
+            f_out.write(len(wrapped_dek).to_bytes(4, 'big'))
+            f_out.write(wrapped_dek)
+            f_out.write(nonce)
+            f_out.write(encrypted_data)
+        logger.info(f"Created combined encrypted file: '{os.path.basename(encrypted_output_file_path)}'.")
+
+        # 5. Upload the final encrypted file to GCS.
+        logger.info(f"Uploading encrypted file '{os.path.basename(encrypted_output_file_path)}' to GCS path '{gcs_path}'...")
+        # Use os.path.normpath to ensure correct path separators for the OS
+        norm_encrypted_path = os.path.normpath(encrypted_output_file_path)
+        upload_result = subprocess.run(
+            ['cmd', '/c', GCLOUD_PATH, "storage", "cp", norm_encrypted_path, gcs_path, f"--project={GCP_PROJECT_ID}"],
+            capture_output=True,
+        )
+
+        if upload_result.returncode != 0:
+            stderr_str = upload_result.stderr.decode().strip()
+            # This is likely a network/auth error, so move to staging for retry.
+            logger.error(f"FAILURE: Upload of encrypted file failed for '{file_name}'. Moving to staging. Error: {stderr_str}")
+            move_to_staging_folder(file_path, "Upload of encrypted file failed")
+            return False
+        else:
+            logger.info(f"SUCCESS: Upload of encrypted file succeeded for '{file_name}'.")
+            # Archive the ORIGINAL file
+            ensure_directory_exists(os.path.dirname(archive_dest))
+            shutil.move(file_path, archive_dest)
+            logger.info(f"Archived original file '{file_name}' to '{archive_dest}'.")
+            msg = f"[{alert_name}] '{file_name}' was encrypted via Envelope Encryption and uploaded to bucket ({pattern_type}). Original file archived."
             send_cloud_log_entry(
                 severity="INFO",
                 message=msg,
@@ -572,198 +481,40 @@ def _process_locked_encrypt_file(file_path, source_file_path=None):
                     "event_type": alert_name,
                     "file": file_name,
                     "bucket_path": gcs_path,
-                    "archive_path": archive_path,
-                    "source_archive_path": source_archive_path,
-                    "encryption_method": "manual-kms-envelope",
+                    "archive_path": archive_dest,
                 },
             )
-            logger.info("="*80 + "\n") # End of process separator
-            # --- FIX: Clean up the temporary encrypted file on success ---
-            if encrypted_output_file_path and os.path.exists(encrypted_output_file_path):
-                os.remove(encrypted_output_file_path)
-                logger.debug(f"Cleaned up temporary encrypted file: '{encrypted_output_file_path}'.")
-            return True  # Success, exit the function
-
-        except subprocess.TimeoutExpired:
-            error_msg = f"Attempt {attempt + 1}/{max_retries} FAILED for '{file_name}' due to a timeout. The upload took too long."
-            logger.error(error_msg)
-            timed_out = True
-            last_exception = Exception(error_msg)
-
-        except Exception as e:
-            last_exception = e
-            logger.error(
-                f"Attempt {attempt + 1}/{max_retries} FAILED for '{file_name}' with a gcloud/network exception: {str(e)}",
-                exc_info=True,
-            )
-            # If the exception has stderr (from a subprocess failure), log it.
-            if hasattr(e, 'stderr') and e.stderr:
-                 logger.error(f"  Stderr: {e.stderr.decode()}")
-
-        if attempt < max_retries - 1:
-            logger.info(f"Retrying '{file_name}' after {retry_delay_seconds} seconds...")
-            time.sleep(retry_delay_seconds)
-
-    error_text = str(last_exception) if last_exception else "Unknown error"
-    if hasattr(last_exception, "stderr") and last_exception.stderr:
-        error_text = f"{error_text} | stderr: {last_exception.stderr.decode(errors='ignore')}"
-
-    if timed_out:
-        move_to_error_folder(file_path, "GCS upload timed out")
-        if source_file_path:
-            move_to_error_folder(source_file_path, f"GCS upload timed out for '{file_name}'")
-    elif is_authentication_error(error_text):
-        logger.warning(f"Authentication/authorization issue detected for '{file_name}'. Moving to staging.")
-        move_to_staging_folder(file_path, f"Authentication/authorization failure: {error_text}")
-        if source_file_path:
-            move_to_staging_folder(source_file_path, f"Authentication/authorization failure during upload for '{file_name}'")
-    else:
-        logger.error(f"FAILURE: All attempts to process '{file_name}' failed. Moving to error folder.")
-        move_to_error_folder(file_path, f"Upload failed after {max_retries} retries: {error_text}")
-        if source_file_path:
-            move_to_error_folder(source_file_path, f"Upload failed after {max_retries} retries for '{file_name}'")
-    logger.error("="*80 + "\n")
-    # --- FIX: Clean up the temporary encrypted file on failure ---
-    if encrypted_output_file_path and os.path.exists(encrypted_output_file_path):
-        os.remove(encrypted_output_file_path)
-        logger.debug(f"Cleaned up temporary encrypted file: '{encrypted_output_file_path}'.")
-
-    return False
-
-
-def process_ie_file(file_path):
-    """
-    Processes a raw IE file, filters it based on acquirer IDs, and writes
-    the result to the zip_watch_folder for subsequent encryption and upload.
-    """
-    file_name = os.path.basename(file_path)
-    lock_path = file_path + ".lock"
-    lock = FileLock(lock_path, timeout=1)
-
-    try:
-        with lock:
-            return _process_locked_ie_file(file_path)
-    except Timeout:
-        logger.debug(f"File '{file_name}' is locked by another process. Skipping.")
-        return None
-
-def _process_locked_ie_file(file_path):
-    file_name = os.path.basename(file_path)
-
-    logger.info("\n" + "="*80)
-    logger.info(f"START: Copying, filtering, and zipping IE file '{file_name}'")
-
-    # --- NEW: Retry loop for file stability check ---
-    max_stability_retries = 5
-    is_ready = False
-    reason = "Unknown"
-    for stability_attempt in range(max_stability_retries):
-        logger.info(f"Checking IE file stability for '{file_name}' (Attempt {stability_attempt + 1}/{max_stability_retries})...")
-        is_ready, reason = wait_file_ready(file_path)
-        if is_ready:
-            break # File is ready, exit the loop
-        elif reason == "File disappeared" or reason == "File is empty":
-            break # No point in retrying if file is gone or empty
-        if stability_attempt < max_stability_retries - 1:
-            logger.info(f"Will re-check stability for '{file_name}' in the next main loop cycle.")
-
-    if not is_ready:
-        logger.error(f"FAILURE: IE File '{file_name}' was not ready after {max_stability_retries} attempts. Reason: {reason}. Moving to error folder.")
-        move_to_error_folder(file_path, f"IE file not stable after {max_stability_retries} attempts ({max_stability_retries * (FILE_STABILITY_WAIT_SECONDS/60):.0f} mins total). Reason: {reason}")
-        logger.warning("="*80 + "\n")
-        return None
-
-    if "_" in file_name:
-        output_file_name = file_name.split("_", 1)[-1]
-    else:
-        output_file_name = file_name
-
-    in_copy_path = build_unique_path(IN_DIRECTORY, file_name)
-    output_path = build_unique_path(IN_DIRECTORY, output_file_name)
-    output_base_name = os.path.basename(output_path)
-    zip_output_path = build_unique_path(IN_DIRECTORY, f"{output_base_name}.zip")
-    try:
-        shutil.copy2(file_path, in_copy_path)
-        logger.info(f"Copied '{file_name}' from PROCESSED to IN as '{os.path.basename(in_copy_path)}'.")
-
-        with open(in_copy_path, "r", encoding="windows-1252") as f:
-            lines = [line.rstrip("\n") for line in f]
-
-        df = pd.DataFrame({"line": lines})
-
-        df["batch_sequence_start"] = df["line"].str.startswith("01")
-        df["batch_sequence"] = df["batch_sequence_start"].cumsum()
-
-        transaction_prefixes = ("11", "40", "43", "65", "61", "71")
-        transaction_start = df["line"].str.startswith(transaction_prefixes).astype(int)
-        df["transaction_start"] = transaction_start
-        df["transaction_sequence"] = df["transaction_start"].cumsum()
-        
-        # --- REFACTORED: Use np.select for more efficient acquirer_id extraction ---
-        conditions = [
-            df['line'].str.startswith('11'),
-            df['line'].str.startswith('40'),
-            df['line'].str.startswith('43'),
-            df['line'].str.startswith('61'),
-            df['line'].str.startswith('65'),
-            df['line'].str.startswith('71')
-        ]
-        choices = [
-            df['line'].str.slice(start=7, stop=18),
-            df['line'].str.slice(start=15, stop=26),
-            df['line'].str.slice(start=15, stop=26),
-            df['line'].str.slice(start=6, stop=17),
-            df['line'].str.slice(start=4, stop=15),
-            df['line'].str.slice(start=120, stop=131)
-        ]
-        df['acquirer_id'] = np.select(conditions, choices, default=None)
-
-        df["acquirer_id"] = df.groupby("transaction_sequence")["acquirer_id"].transform(
-            "first"
-        )
-        df.loc[df["line"].str.startswith(("01", "98", "99", "00")), "acquirer_id"] = (
-            np.nan
-        )
-
-        filtered_df = df[
-            (df["acquirer_id"].isin(IE_ACQUIRER_IDS)) | (df["acquirer_id"].isnull())
-        ]
-
-        # Write the filtered content to the output file
-        with open(output_path, "w", encoding="utf-8") as f:
-            for line in filtered_df["line"]:
-                f.write(line + "\n")
-        logger.info(
-            f"Filtered content from '{file_name}' into '{output_base_name}'."
-        )
-
-        # --- NEW: Zip the processed file ---
-        logger.info(f"Compressing '{output_base_name}' into '{os.path.basename(zip_output_path)}'...")
-        with zipfile.ZipFile(zip_output_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            zipf.write(output_path, arcname=output_base_name)
-        
-        # Clean up the original unzipped file
-        safe_remove_file(output_path)
-
-        logger.info(f"COMPLETED: Copy/filter/zip for '{file_name}'. Output is '{os.path.basename(zip_output_path)}'.")
-        return zip_output_path
-
+            return True
+    except subprocess.CalledProcessError as e:
+        # This is a gcloud command failure, likely network/auth or permissions. Move to staging for retry.
+        logger.error(f"FAILURE: A gcloud subprocess failed for '{file_name}'. Moving to staging. Stderr: {e.stderr.decode()}", exc_info=True)
+        move_to_staging_folder(file_path, "A gcloud subprocess failed (e.g., KMS wrap or GCS cp)")
+        return False
     except Exception as e:
-        logger.error(f"Failed to process IE file '{file_name}': {e}", exc_info=True)
-        logger.error("="*80 + "\n")
-        move_to_error_folder(file_path, f"Failed during copy/filter/zip stage: {e}")
-        safe_remove_file(zip_output_path)
-        return None
+        # A local file I/O error or other unexpected code issue. This is less likely to be retriable.
+        logger.error(f"FAILURE: An unexpected exception occurred for '{file_name}': {str(e)}", exc_info=True)
+        move_to_error_folder(file_path, f"Unexpected exception during processing: {str(e)}")
+        return False
     finally:
-        safe_remove_file(in_copy_path)
-        safe_remove_file(output_path)
+        # Clean up the temporary encrypted file
+        if os.path.exists(encrypted_output_file_path): # Add retry logic for cleanup
+            cleanup_attempts = 3
+            for i in range(cleanup_attempts):
+                try:
+                    os.remove(encrypted_output_file_path)
+                    logger.info(f"Cleaned up temporary encrypted file: '{os.path.basename(encrypted_output_file_path)}'.")
+                    break # Success, exit loop
+                except OSError as e:
+                    logger.warning(f"Attempt {i+1}/{cleanup_attempts} to remove temporary file '{os.path.basename(encrypted_output_file_path)}' failed. It may be locked. Error: {e}")
+                    if i < cleanup_attempts - 1:
+                        time.sleep(1) # Wait before retrying
+                    else:
+                        logger.error(f"Could not remove temporary file '{os.path.basename(encrypted_output_file_path)}' after {cleanup_attempts} attempts. Manual cleanup may be required.", exc_info=True)
 
 
 def handle_ctrlc(sig, frame):
     global is_ctrlc_exit
-    logger.critical(
-        "\nCtrl+C detected. Initiating graceful shutdown. Will exit after the current file is processed."
-    )
+    logger.critical("\nCtrl+C detected. Initiating graceful shutdown. Will exit after the current file is processed.")
     is_ctrlc_exit = True
     send_cloud_log_entry(
         severity="CRITICAL",
@@ -777,174 +528,90 @@ signal.signal(signal.SIGINT, handle_ctrlc)
 
 
 def main():
-    global is_ctrlc_exit, gcloud_auth_success
-    # Take a snapshot of files present at startup to ignore them.
-    logger.info(
-        f"Scanning for existing files in '{PROCESSED_FILES_DIRECTORY}' to ignore..."
-    )
-    initial_ie_files = {}
-    for existing_path in glob.glob(os.path.join(PROCESSED_FILES_DIRECTORY, "*")):
-        if os.path.isfile(existing_path):
-            try:
-                initial_ie_files[existing_path] = os.path.getmtime(existing_path)
-            except FileNotFoundError:
-                logger.debug(f"Skipping vanished startup file during snapshot: '{existing_path}'")
-                continue
-    logger.info(f"Found {len(initial_ie_files)} existing files to ignore. Now watching for new files.")
-    authenticate_gcloud()
-    send_cloud_log_entry(
-        severity="INFO",
-        message="GCS IE Uploader script started and is now monitoring incoming files for upload.",
-        log_name=activity_log_name,
-        data={"event_type": "ScriptStartup"},
-    )
-    logger.info(
-        f"Monitoring folders: '{PROCESSED_FILES_DIRECTORY}' and '{IN_DIRECTORY}'. Press Ctrl+C to stop."
-    )
+    global is_ctrlc_exit
+    if authenticate_gcloud():
+        send_cloud_log_entry(
+            severity="INFO",
+            message="GCS ZIP Uploader script started and is now monitoring incoming files for upload.",
+            log_name=activity_log_name,
+            data={"event_type": "ScriptStartup"},
+        )
+        send_cloud_log_entry(
+            severity="INFO",
+            message="GCS Swan Report ZIP Uploader script started and is now monitoring incoming files for upload.",
+            log_name=swan_report_log_name,
+            data={"event_type": "SwanReportScriptStartup"},
+        )
+    else:
+        logger.critical("Authentication failed. Script cannot start.")
+        return # Exit if authentication fails
 
+    logger.info(f"Monitoring ZIP folder: {zip_watch_folder} for new files. Press Ctrl+C to stop.")
+
+    # --- MODIFIED: Add a timer for checking the staging folder. ---
     last_heartbeat_time = time.time()
-    staging_retry_state = {}
-    staging_retry_exhausted_logged = set()
+    last_staging_check_time = 0 # Set to 0 to trigger an immediate check on first run
+    STAGING_CHECK_INTERVAL_SECONDS = 1200 # 20 minutes
 
     try:
         while True:
+            time.sleep(5) # Main loop delay to prevent busy-looping.
             if is_ctrlc_exit:
                 break
+
+            # Send heartbeat every HEARTBEAT_INTERVAL_SECONDS seconds
             current_time = time.time()
-            if current_time - last_heartbeat_time >= HEARTBEAT_INTERVAL_SECONDS:
+            if current_time - last_heartbeat_time > HEARTBEAT_INTERVAL_SECONDS:
                 send_cloud_log_entry(
                     severity="INFO",
-                    message="Heartbeat: IE Uploader script is running normally.",
+                    message="Heartbeat: ZIP Uploader script is running normally.",
                     log_name=activity_log_name,
                     data={"event_type": "Heartbeat"},
                 )
                 last_heartbeat_time = current_time
                 logger.debug("Sent heartbeat log entry.")
 
-            # --- PRIORITY 1: Process staged files ---
-            # Use sorted order so retry order is deterministic across loop iterations.
-            staged_files = sorted(glob.glob(os.path.join(STAGING_DIRECTORY, "*.zip")))
-            staged_file_set = set(staged_files)
-            for tracked_file in list(staging_retry_state.keys()):
-                if tracked_file not in staged_file_set:
-                    staging_retry_state.pop(tracked_file, None)
-                    staging_retry_exhausted_logged.discard(tracked_file)
-
-            if staged_files:
-                logger.info(f"Found {len(staged_files)} file(s) in staging.")
-                due_staged_files = []
-                for file_path in staged_files:
-                    state = staging_retry_state.setdefault(
-                        file_path,
-                        {"attempts": 0, "next_retry_time": current_time},
-                    )
-                    if state["attempts"] >= STAGING_MAX_RETRIES:
-                        if file_path not in staging_retry_exhausted_logged:
-                            send_cloud_log_entry(
-                                severity="ERROR",
-                                message=(
-                                    f"Staged file '{os.path.basename(file_path)}' reached max retries "
-                                    f"({state['attempts']}/{STAGING_MAX_RETRIES}) and will no longer be retried automatically."
-                                ),
-                                log_name=critical_error_log_name,
-                                data={
-                                    "event_type": "StagingRetryExhausted",
-                                    "file": os.path.basename(file_path),
-                                    "retry_attempts": state["attempts"],
-                                    "retry_interval_seconds": STAGING_RETRY_INTERVAL_SECONDS,
-                                },
-                            )
-                            staging_retry_exhausted_logged.add(file_path)
-                        continue
-
-                    if current_time >= state["next_retry_time"]:
-                        due_staged_files.append(file_path)
-
-                if due_staged_files:
-                    try:
-                        authenticate_gcloud(force_reauthenticate=True)
-                    except Exception:
-                        logger.warning(
-                            "Authentication failed. Will retry due staged files later without blocking PROCESSED handling.",
-                            exc_info=True,
-                        )
-                        next_retry_at = current_time + STAGING_RETRY_INTERVAL_SECONDS
-                        for file_path in due_staged_files:
-                            if file_path in staging_retry_state:
-                                staging_retry_state[file_path]["next_retry_time"] = next_retry_at
-                    else:
-                        for file_path in due_staged_files:
-                            if is_ctrlc_exit:
-                                break
-                            if not os.path.isfile(file_path):
-                                staging_retry_state.pop(file_path, None)
-                                staging_retry_exhausted_logged.discard(file_path)
-                                continue
-
-                            state = staging_retry_state[file_path]
-                            attempt_no = state["attempts"] + 1
-                            logger.info(
-                                f"Retrying staged file: {os.path.basename(file_path)} "
-                                f"(Attempt {attempt_no}/{STAGING_MAX_RETRIES})"
-                            )
-                            # Only an explicit True result is treated as success.
-                            success = encrypt_upload_and_archive(file_path)
-                            if success is True:
-                                staging_retry_state.pop(file_path, None)
-                                staging_retry_exhausted_logged.discard(file_path)
-                            else:
-                                state["attempts"] = attempt_no
-                                state["next_retry_time"] = current_time + STAGING_RETRY_INTERVAL_SECONDS
-
-            # --- Process NEW IE files ---
-            # Check for files that were not present at startup.
-            current_ie_files = glob.glob(os.path.join(PROCESSED_FILES_DIRECTORY, "*"))
-            for file_path in current_ie_files:
-                if is_ctrlc_exit: break
+            # --- MODIFIED: Process new files from the main watch folder on every loop. ---
+            current_files = glob.glob(os.path.join(zip_watch_folder, "*.zip"))
+            for file_path in current_files:
                 if os.path.isfile(file_path):
-                    try:
-                        file_mtime = os.path.getmtime(file_path)
-                    except FileNotFoundError:
-                        logger.debug(f"Skipping vanished file during monitoring cycle: '{file_path}'")
-                        continue
-
-                    previous_mtime = initial_ie_files.get(file_path)
-                    if previous_mtime is not None and file_mtime <= previous_mtime:
-                        continue
-
-                    zip_file_path = process_ie_file(file_path)
-                    if zip_file_path:
-                        encrypt_upload_and_archive(zip_file_path, source_file_path=file_path)
-                    initial_ie_files[file_path] = file_mtime
-
-            encrypt_files = glob.glob(os.path.join(IN_DIRECTORY, "*.zip"))
-            for file_path in encrypt_files:
-                if is_ctrlc_exit: break
-                if os.path.isfile(file_path):
-                    # This function now moves the original .zip file upon success or failure,
-                    # so it won't be processed again in the next loop.
-                    encrypt_upload_and_archive(file_path)
-
-            time.sleep(1)
-
+                    upload_and_archive_zip(file_path)
+            
+            # --- MODIFIED: Periodically check the staging folder for files to retry. ---
+            if current_time - last_staging_check_time >= STAGING_CHECK_INTERVAL_SECONDS:
+                logger.info(f"Scheduled check: Looking for files to retry in '{staging_folder}'...")
+                # Attempt to re-authenticate to ensure connection is fresh before retrying.
+                if authenticate_gcloud(max_retries=1):
+                    staged_files = glob.glob(os.path.join(staging_folder, "*.zip"))
+                    if staged_files:
+                        logger.info(f"Found {len(staged_files)} file(s) in staging. Attempting to process them.")
+                        for file_path in staged_files:
+                            if is_ctrlc_exit: break
+                            if os.path.isfile(file_path):
+                                logger.info(f"Retrying staged file: {os.path.basename(file_path)}")
+                                upload_and_archive_zip(file_path)
+                else:
+                    logger.warning("Authentication failed. Cannot process staged files. Will try again in 20 minutes.")
+                last_staging_check_time = current_time
 
     except Exception as e:
         error_message = str(e)
-        logger.critical(
-            f"CRITICAL SCRIPT ERROR: Script terminated unexpectedly. Error: {error_message}",
-            exc_info=True,
+        logger.critical(f"CRITICAL SCRIPT ERROR: Script terminated unexpectedly. Error: {error_message}", exc_info=True)
+        send_cloud_log_entry(
+            severity="ERROR",
+            message=f"GCS ZIP Uploader script terminated unexpectedly: {error_message}",
+            log_name=critical_error_log_name,
+            data={"error_type": "UnexpectedTermination", "full_error": error_message},
         )
         send_cloud_log_entry(
             severity="ERROR",
-            message=f"GCS IE Uploader script terminated unexpectedly: {error_message}",
-            log_name=critical_error_log_name,
+            message=f"GCS Swan Report ZIP Uploader script terminated unexpectedly: {error_message}",
+            log_name=swan_report_log_name,
             data={"error_type": "UnexpectedTermination", "full_error": error_message},
         )
         raise
     finally:
-        logger.info(
-            f"Script finished. Check Cloud Logging '{critical_error_log_name}' for details if an error occurred."
-        )
+        logger.info(f"Script finished. Check Cloud Logging '{critical_error_log_name}' and '{swan_report_log_name}' for details if an error occurred.")
 
 
 def run_script_with_retries(max_retries=3, delay_seconds=10):
@@ -952,13 +619,12 @@ def run_script_with_retries(max_retries=3, delay_seconds=10):
     while attempt < max_retries:
         try:
             main()
+            # If main() exits, it's either a graceful shutdown or an unrecoverable auth failure.
+            # In either case, we should break the retry loop.
             break
         except Exception as e:
             attempt += 1
-            logger.error(
-                f"Attempt {attempt} of {max_retries} failed with exception: {str(e)}",
-                exc_info=True,
-            )
+            logger.error(f"Attempt {attempt} of {max_retries} failed with exception: {str(e)}", exc_info=True)
             if attempt < max_retries:
                 logger.info(f"Retrying after {delay_seconds} seconds...")
                 time.sleep(delay_seconds)
@@ -966,7 +632,7 @@ def run_script_with_retries(max_retries=3, delay_seconds=10):
                 logger.critical("Maximum retry attempts reached. Script will exit.")
                 send_cloud_log_entry(
                     severity="CRITICAL",
-                    message=f"IE Uploader script failed after {max_retries} retries. Manual intervention required.",
+                    message=f"ZIP uploader script failed after {max_retries} retries. Manual intervention required.",
                     log_name=critical_error_log_name,
                     data={"event_type": "MaxRetryFailure"},
                 )
