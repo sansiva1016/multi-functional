@@ -36,6 +36,8 @@ service_account_key = r"D:\Tools\google-cloud-sdk-517.0.0-windows-x86_64-bundled
 kms_key_name = "projects/nld-data-pltf-acquiring-prod/locations/europe/keyRings/prod_swan_inbound_encryption-PhwwT/cryptoKeys/prod_swan_inbound_encryption_kms_key"
 
 DEFAULT_GCS_BUCKET = f"gs://{GCP_PROJECT_ID}-swan-inbound/in/swan-inbound"
+RE_PROCESSING_GCS_FOLDER = f"gs://{GCP_PROJECT_ID}-swan-inbound/in/re_processing_files"
+RE_PROCESSING_CHECK_INTERVAL_SECONDS = 10 * 60  # 10 minutes
 critical_error_log_name = "ie-uploader-activity"
 activity_log_name = "ie-uploader-activity"
 
@@ -746,6 +748,337 @@ def _process_locked_ie_file(file_path):
         safe_remove_file(output_path)
 
 
+def list_gcs_txt_files(gcs_folder):
+    """Lists all .txt files in a GCS folder. Returns a list of full GCS paths."""
+    command = [
+        'cmd', '/c', GCLOUD_PATH, "storage", "ls",
+        f"{gcs_folder}/*.txt",
+        f"--project={GCP_PROJECT_ID}",
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, check=False)
+        if result.returncode != 0:
+            stderr = result.stderr.decode(errors='ignore').strip()
+            # An empty folder or no matching files is not an error
+            if not stderr or "no URLs matched" in stderr.lower() or "One or more URLs matched no objects" in stderr:
+                return []
+            logger.warning(f"[RE-PROCESS] gcloud storage ls returned non-zero for '{gcs_folder}': {stderr}")
+            return []
+        output = result.stdout.decode(errors='ignore').strip()
+        if not output:
+            return []
+        return [line.strip() for line in output.splitlines() if line.strip().endswith('.txt')]
+    except Exception as e:
+        logger.error(f"[RE-PROCESS] Failed to list GCS txt files in '{gcs_folder}': {e}", exc_info=True)
+        return []
+
+
+def download_gcs_file(gcs_path, local_path):
+    """Downloads a single file from GCS to a local path. Returns True on success."""
+    command = [
+        'cmd', '/c', GCLOUD_PATH, "storage", "cp",
+        gcs_path, local_path,
+        f"--project={GCP_PROJECT_ID}",
+    ]
+    try:
+        subprocess.run(command, capture_output=True, check=True, timeout=120)
+        return True
+    except subprocess.CalledProcessError as e:
+        logger.error(
+            f"[RE-PROCESS] Failed to download '{gcs_path}': {e.stderr.decode(errors='ignore').strip()}",
+            exc_info=True,
+        )
+        return False
+    except Exception as e:
+        logger.error(f"[RE-PROCESS] Failed to download '{gcs_path}': {e}", exc_info=True)
+        return False
+
+
+def delete_gcs_file(gcs_path):
+    """Deletes a file from GCS. Returns True on success."""
+    command = [
+        'cmd', '/c', GCLOUD_PATH, "storage", "rm",
+        gcs_path,
+        f"--project={GCP_PROJECT_ID}",
+    ]
+    try:
+        subprocess.run(command, capture_output=True, check=True, timeout=60)
+        logger.info(f"[RE-PROCESS] Deleted GCS trigger file: '{gcs_path}'")
+        return True
+    except Exception as e:
+        logger.error(f"[RE-PROCESS] Failed to delete GCS file '{gcs_path}': {e}", exc_info=True)
+        return False
+
+
+def find_archived_file_for_reprocessing(file_name):
+    """
+    Searches the archive folder for a file whose name exactly matches file_name
+    (e.g. IEXXXXXXXX.zip). Returns the archive file path if found, otherwise None.
+    """
+    if not file_name:
+        return None
+    return find_archived_file_match(file_name)
+
+
+def _reprocess_encrypt_and_upload(archive_file_path, requested_name):
+    """
+    Re-encrypts an archived file and re-uploads it to GCS.
+    Skips the duplicate check and does NOT move the archive file (it stays in archive).
+    """
+    max_retries = GCP_OPERATION_MAX_RETRIES
+    retry_delay_seconds = GCP_RETRY_DELAY_SECONDS
+    archive_file_name = os.path.basename(archive_file_path)
+
+    if "_" in archive_file_name:
+        gcs_object_name = archive_file_name.split("_", 1)[-1]
+    else:
+        gcs_object_name = archive_file_name
+    gcs_path = f"{DEFAULT_GCS_BUCKET}/{gcs_object_name}"
+
+    logger.info(
+        f"[RE-PROCESS] Starting re-encryption and upload for '{archive_file_name}' "
+        f"(requested: '{requested_name}') -> '{gcs_path}'"
+    )
+
+    encrypted_output_file_path = None
+    last_exception = None
+    timed_out = False
+
+    for attempt in range(max_retries):
+        encrypted_output_file_path = os.path.join(ARCHIVE_DIRECTORY, archive_file_name + ".enc")
+        try:
+            # 1. Generate a new DEK
+            dek = AESGCM.generate_key(bit_length=256)
+            logger.info(f"[RE-PROCESS] Generated 256-bit DEK for '{archive_file_name}'.")
+
+            # 2. Wrap DEK using KMS
+            logger.info(
+                f"[RE-PROCESS] Attempt {attempt + 1}/{max_retries}: Wrapping DEK for '{archive_file_name}'..."
+            )
+            key_parts = kms_key_name.split('/')
+            kms_project = key_parts[1]
+            kms_location = key_parts[3]
+            kms_keyring = key_parts[5]
+            kms_key = key_parts[7]
+
+            wrap_dek_command = [
+                'cmd', '/c', GCLOUD_PATH, "kms", "encrypt",
+                f"--project={kms_project}",
+                f"--location={kms_location}",
+                f"--keyring={kms_keyring}",
+                f"--key={kms_key}",
+                "--plaintext-file=-",
+                "--ciphertext-file=-",
+            ]
+            wrap_proc = subprocess.run(wrap_dek_command, input=dek, capture_output=True, check=True)
+            wrapped_dek = wrap_proc.stdout
+            logger.info(f"[RE-PROCESS] Successfully wrapped DEK for '{archive_file_name}'.")
+
+            # 3. Encrypt file content locally using the DEK
+            with open(archive_file_path, "rb") as f_in:
+                plaintext_data = f_in.read()
+
+            aes_gcm = AESGCM(dek)
+            nonce = os.urandom(12)
+            encrypted_data = aes_gcm.encrypt(nonce, plaintext_data, None)
+
+            # 4. Write combined encrypted file using envelope encryption format:
+            #    [4 bytes big-endian wrapped_dek length][wrapped_dek][12-byte nonce][AES-GCM ciphertext]
+            #    This format must match the corresponding decryption implementation.
+            with open(encrypted_output_file_path, "wb") as f_out:
+                f_out.write(len(wrapped_dek).to_bytes(4, 'big'))
+                f_out.write(wrapped_dek)
+                f_out.write(nonce)
+                f_out.write(encrypted_data)
+            logger.info(f"[RE-PROCESS] Created encrypted file: '{os.path.basename(encrypted_output_file_path)}'.")
+
+            # 5. Upload encrypted file to GCS
+            logger.info(
+                f"[RE-PROCESS] Uploading '{os.path.basename(encrypted_output_file_path)}' to '{gcs_path}'..."
+            )
+            upload_command = [
+                'cmd', '/c', GCLOUD_PATH, "storage", "cp",
+                encrypted_output_file_path, gcs_path,
+                f"--project={GCP_PROJECT_ID}",
+            ]
+            subprocess.run(upload_command, capture_output=True, check=True, timeout=900)
+            logger.info(f"[RE-PROCESS] SUCCESS: Re-uploaded '{gcs_object_name}' to GCS.")
+
+            send_cloud_log_entry(
+                severity="INFO",
+                message=f"[ReProcessSuccess] '{gcs_object_name}' was re-encrypted and re-uploaded from archive.",
+                log_name=activity_log_name,
+                data={
+                    "event_type": "ReProcessFileSuccess",
+                    "requested_name": requested_name,
+                    "archive_file": archive_file_name,
+                    "bucket_path": gcs_path,
+                },
+            )
+            logger.info("=" * 80 + "\n")
+            if encrypted_output_file_path and os.path.exists(encrypted_output_file_path):
+                os.remove(encrypted_output_file_path)
+                logger.debug(f"[RE-PROCESS] Cleaned up temp encrypted file: '{encrypted_output_file_path}'.")
+            return True
+
+        except subprocess.TimeoutExpired:
+            error_msg = (
+                f"[RE-PROCESS] Attempt {attempt + 1}/{max_retries} FAILED for '{archive_file_name}' "
+                "due to timeout."
+            )
+            logger.error(error_msg)
+            timed_out = True
+            last_exception = Exception(error_msg)
+
+        except Exception as e:
+            last_exception = e
+            logger.error(
+                f"[RE-PROCESS] Attempt {attempt + 1}/{max_retries} FAILED for '{archive_file_name}': {e}",
+                exc_info=True,
+            )
+            if hasattr(e, 'stderr') and e.stderr:
+                logger.error(f"  Stderr: {e.stderr.decode(errors='ignore')}")
+
+        if attempt < max_retries - 1:
+            logger.info(f"[RE-PROCESS] Retrying '{archive_file_name}' after {retry_delay_seconds} seconds...")
+            time.sleep(retry_delay_seconds)
+
+    error_text = str(last_exception) if last_exception else "Unknown error"
+    if hasattr(last_exception, "stderr") and last_exception.stderr:
+        error_text = f"{error_text} | stderr: {last_exception.stderr.decode(errors='ignore')}"
+
+    logger.error(
+        f"[RE-PROCESS] FAILURE: All {max_retries} attempt(s) to re-process '{archive_file_name}' failed."
+    )
+    send_cloud_log_entry(
+        severity="ERROR",
+        message=(
+            f"[ReProcessFailure] Failed to re-upload '{archive_file_name}' "
+            f"after {max_retries} retries: {error_text}"
+        ),
+        log_name=critical_error_log_name,
+        data={
+            "event_type": "ReProcessFileFailure",
+            "requested_name": requested_name,
+            "archive_file": archive_file_name,
+            "error": error_text,
+        },
+    )
+    if encrypted_output_file_path and os.path.exists(encrypted_output_file_path):
+        os.remove(encrypted_output_file_path)
+        logger.debug(f"[RE-PROCESS] Cleaned up temp encrypted file: '{encrypted_output_file_path}'.")
+    return False
+
+
+def reprocess_archived_file(file_name):
+    """
+    Looks up a file by name in the archive folder and re-sends it with encryption.
+    Logs a warning if the file is not found in the archive.
+    """
+    file_name = file_name.strip()
+    if not file_name:
+        return
+    archive_path = find_archived_file_for_reprocessing(file_name)
+    if not archive_path:
+        logger.warning(
+            f"[RE-PROCESS] GCS bucket .txt file name '{file_name}' not found in archive folder."
+        )
+        send_cloud_log_entry(
+            severity="WARNING",
+            message=(
+                f"[ReProcessWarning] Re-processing requested for '{file_name}' "
+                "but it was not found in the archive folder."
+            ),
+            log_name=activity_log_name,
+            data={
+                "event_type": "ReProcessFileNotFound",
+                "requested_name": file_name,
+                "archive_folder": ie_archive_folder,
+            },
+        )
+        return
+    logger.info(
+        f"[RE-PROCESS] Found '{file_name}' in archive as '{os.path.basename(archive_path)}'. "
+        "Initiating re-send."
+    )
+    _reprocess_encrypt_and_upload(archive_path, file_name)
+
+
+def check_and_handle_reprocessing_requests():
+    """
+    Polls the GCS re_processing_files folder for .txt trigger files every 10 minutes.
+    Each .txt file may contain one or more comma-separated file names to re-process from
+    the swan archive folder. After processing, the trigger file is deleted from GCS.
+    """
+    logger.info(
+        f"[RE-PROCESS] Checking for re-processing trigger files in '{RE_PROCESSING_GCS_FOLDER}'..."
+    )
+    try:
+        authenticate_gcloud()
+    except Exception as e:
+        logger.error(
+            f"[RE-PROCESS] Authentication failed. Skipping re-processing check. Error: {e}",
+            exc_info=True,
+        )
+        return
+
+    txt_files = list_gcs_txt_files(RE_PROCESSING_GCS_FOLDER)
+    if not txt_files:
+        logger.debug(
+            f"[RE-PROCESS] No .txt trigger files found in '{RE_PROCESSING_GCS_FOLDER}'."
+        )
+        return
+
+    logger.info(f"[RE-PROCESS] Found {len(txt_files)} trigger file(s): {txt_files}")
+
+    for gcs_txt_path in txt_files:
+        if is_ctrlc_exit:
+            break
+        local_tmp_path = os.path.join(
+            ARCHIVE_DIRECTORY, f"_reprocess_trigger_{os.path.basename(gcs_txt_path)}"
+        )
+        try:
+            logger.info(f"[RE-PROCESS] Processing trigger file: '{gcs_txt_path}'")
+            if not download_gcs_file(gcs_txt_path, local_tmp_path):
+                logger.error(
+                    f"[RE-PROCESS] Failed to download trigger file '{gcs_txt_path}'. Skipping."
+                )
+                continue
+
+            with open(local_tmp_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+
+            # Normalise newlines to commas so users can separate names with either
+            # commas or newlines (or a mix of both).
+            normalised = content.replace("\r\n", ",").replace("\n", ",").replace("\r", ",")
+            file_names = [name.strip() for name in normalised.split(",") if name.strip()]
+            if not file_names:
+                logger.warning(
+                    f"[RE-PROCESS] Trigger file '{os.path.basename(gcs_txt_path)}' "
+                    "is empty or contains no valid file names. Deleting trigger file."
+                )
+            else:
+                logger.info(
+                    f"[RE-PROCESS] Trigger file '{os.path.basename(gcs_txt_path)}' contains "
+                    f"{len(file_names)} file name(s): {file_names}"
+                )
+                for file_name in file_names:
+                    if is_ctrlc_exit:
+                        break
+                    reprocess_archived_file(file_name)
+
+            # Delete the trigger file from GCS to prevent re-processing on the next check
+            delete_gcs_file(gcs_txt_path)
+
+        except Exception as e:
+            logger.error(
+                f"[RE-PROCESS] Error processing trigger file '{gcs_txt_path}': {e}",
+                exc_info=True,
+            )
+        finally:
+            safe_remove_file(local_tmp_path)
+
+
 def handle_ctrlc(sig, frame):
     global is_ctrlc_exit
     logger.critical(
@@ -790,6 +1123,7 @@ def main():
     )
 
     last_heartbeat_time = time.time()
+    last_reprocessing_check_time = 0  # Set to 0 so the first check runs on startup (trigger files may already be waiting)
     staging_retry_state = {}
     staging_retry_exhausted_logged = set()
 
@@ -807,6 +1141,11 @@ def main():
                 )
                 last_heartbeat_time = current_time
                 logger.debug("Sent heartbeat log entry.")
+
+            # --- Re-processing check: every 10 minutes ---
+            if current_time - last_reprocessing_check_time >= RE_PROCESSING_CHECK_INTERVAL_SECONDS:
+                check_and_handle_reprocessing_requests()
+                last_reprocessing_check_time = current_time
 
             # --- PRIORITY 1: Process staged files ---
             # Use sorted order so retry order is deterministic across loop iterations.
