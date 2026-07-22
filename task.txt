@@ -1,0 +1,17 @@
+Here are **all the points from both images** in a single numbered list:
+
+1. GitLab Pipeline Job – Load files into GCS Bucket.
+2. GitLab Pipeline drawback – No rollback.
+3. Implement Terraform as the solution for rollback/infrastructure management.
+4. GCP Custom Dashboard – Monitor application/infrastructure metrics.
+5. Configure threshold-based alerts in the custom dashboard.
+6. Improve custom IAM roles.
+7. Remove default IAM roles where custom roles are sufficient.
+8. Implement log-based alerting (e.g., alert when the RABO client consumes the RPP API).
+9. Improve pipeline scripts for removing changed files, databases, and objects from the bucket.
+10. Write a custom resolver for Dataflow to retrieve GCS bucket lists using Vertex AI.
+11. Automate certificate installation for load balancers (Apigee and GCLB using mTLS).
+12. Enable GCS object versioning or lifecycle policies where required.
+13. Right-size CPU and memory allocation for all services based on current resource utilization.
+14. Scale down all non-production services during weekends for cost optimization.
+15. Implement SSL certificate monitoring, including expiry alerts and renewal before expiration.
